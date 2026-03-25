@@ -174,6 +174,127 @@ All other flags are reasonable defaults reproduced from our experiments and can 
 
 ---
 
+## 5. HeaPA Training with Slime (Megatron + SGLang backend)
+
+The `slime/` directory contains an alternative training stack that replaces VERL's FSDP actor with **Megatron-LM** and uses **SGLang** for rollout generation.  This is the recommended path for large-scale runs on clusters where the slime Docker image is available.
+
+### 5.1 Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| Docker image | `slimerl/slime:nightly-dev-20260202c` (or later nightly) |
+| Slime root | `/root/slime` inside the container |
+| Megatron-LM | `/root/Megatron-LM` inside the container |
+| Python packages | `openai` (for teacher augmentation) |
+
+The container already has `megatron-core`, `megatron-bridge`, and SGLang installed.
+
+### 5.2 File structure
+
+We do not include all files from slime but add some core files. You need to enter the slime docker manully and run the following script.
+
+```
+slime/
+├── __init__.py               # package marker
+├── train.py                  # entry-point wrapper (pre-parses HeaPA args,
+│                             #   patches slime data utils, delegates to /root/slime/train.py)
+├── heapa_core.py             # ThreadSafeQueryPool + QueryRecord (no VERL dependency)
+├── heapa_teacher.py          # SlimeTeacherAnnotator (OpenAI API)
+├── heapa_data_source.py      # HeaPADataSource — slime DataSource ABC implementation
+├── heapa_rollout.py          # generate_rollout — wraps slime sglang rollout + pool update hook
+└── HeaPA_DAPO_PathAgg_MediumOnly_DAPOMath.sh              # end-to-end launch script
+```
+
+### 5.3 Data format
+
+The training and eval parquets must follow the **verl dataset format**:
+
+| Column | Type | Description |
+|---|---|---|
+| `prompt` | list of dicts | Chat-template messages, e.g. `[{"role": "user", "content": "..."}]` |
+| `reward_model` | dict | Must contain `"ground_truth"` key with the reference answer |
+| `data_source` | str | Dataset name tag (e.g. `"dapo_math"`) |
+
+The `label` column is **not** required — `slime/heapa_data_source.py` automatically extracts it from `reward_model["ground_truth"]` at load time.
+
+Use the preparation scripts in `data/` to produce correctly formatted parquets.
+
+### 5.4 Launching a training run
+
+1. **Start your docker environment**:
+  Remember to setup a file mapping, e.g., `-v /fsx-alignment:/fsx-alignment` so that you can copy the code files into your docker environment.
+  ```
+  docker run --gpus all \
+    --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it --rm --privileged --network host \
+    --name=slime \
+    -v /fsx-alignment:/fsx-alignment \
+    --mount type=tmpfs,destination=/tmpfs,tmpfs-mode=1777 \
+    --device /dev/infiniband/uverbs0:/dev/infiniband/uverbs0:rwm \
+    --device /dev/infiniband/uverbs1:/dev/infiniband/uverbs1:rwm \
+    --device /dev/infiniband/uverbs2:/dev/infiniband/uverbs2:rwm \
+    --device /dev/infiniband/uverbs3:/dev/infiniband/uverbs3:rwm \
+    --entrypoint /bin/bash -it slimerl/slime:nightly-dev-20260202c
+  ```
+
+2. **Set required environment variables**:
+   ```bash
+   export WANDB_API_KEY=<your_key>
+   export OPENAI_API_KEY=<your_key>   # only needed when teacher augmentation is enabled
+   ```
+
+3. **Copy slime files into your docker**:
+  Docker environment is using a separate file system so you need to manully copy the slime folder into it.
+   ```bash
+   cp -r /path/to/HeapAugment-DAPO-local /path/to/HeapAugment-DAPO
+   cd /path/to/HeapAugment-DAPO
+   ```
+
+4. **Edit path overrides** in `slime/HeaPA_DAPO_PathAgg_MediumOnly_DAPOMath.sh` (or pass as env vars):
+   ```bash
+   RAY_DATA_HOME=/path/to/HeapAugment-DAPO
+   MODEL_PATH=/path/to/Qwen3-4B-Instruct
+   PROMPT_DATA=/path/to/dapo-math-14k-no_chinese-unique.parquet
+   EVAL_DATA=/path/to/aime-2024-960.parquet
+   SAVE_PATH=/path/to/experiment/checkpoints
+   ```
+
+5. **Submit**:
+   ```bash
+   bash slime/HeaPA_DAPO_PathAgg_MediumOnly_DAPOMath.sh
+   ```
+   The script submits a Ray job and exits immediately (`--no-wait`).  Monitor with:
+   ```bash
+   ray job logs --follow <job_id>
+   ```
+
+### 5.5 Key HeaPA knobs
+
+All HeaPA arguments are prefixed `--heapa-` and pre-parsed by `slime/train.py` before the Megatron argument parser runs.
+
+| Env var | CLI flag | Default | Description |
+|---|---|---|---|
+| `POOL_MAX_SIZE` | `--heapa-pool-max-size` | `1000000` | Max queries kept in heap pool |
+| `LOW_FRACTION` | `--heapa-low-fraction` | `0.5` | Fraction of pool in the low (hard) partition |
+| — | `--heapa-mixed-sampling` | off | Enable mixed easy+medium sampling (omit for medium-only) |
+| `TEACHER_ENABLED` | `--heapa-teacher-enabled` | off | Enable teacher augmentation via OpenAI API |
+| `TEACHER_MODEL` | `--heapa-teacher-model` | `gpt-5-nano` | OpenAI model used for teacher |
+| `TEACHER_WORKERS` | `--heapa-teacher-workers` | `4` | Async worker threads for teacher calls |
+| `TEACHER_HARD_LO` | `--heapa-teacher-hard-lo` | `0.1` | Lower reward bound for medium-difficulty gate |
+| `TEACHER_HARD_HI` | `--heapa-teacher-hard-hi` | `0.7` | Upper reward bound for medium-difficulty gate |
+
+**Medium-only mode** (default): teacher is triggered for queries whose average reward falls in `(TEACHER_HARD_LO, TEACHER_HARD_HI)`.
+**Mixed sampling mode**: pass `--heapa-mixed-sampling` to also draw from the easy (high-reward) partition.
+
+### 5.6 PYTHONPATH
+
+When running outside the provided `HeaPA_DAPO_PathAgg_MediumOnly_DAPOMath.sh`, make sure the following are all on `PYTHONPATH`:
+
+```bash
+export PYTHONPATH=/path/to/HeapAugment-DAPO:/root/slime:/root/Megatron-LM:${PYTHONPATH}
+```
+
+---
+
 ## Base Framework: VERL 0.6.1
 
 _HeaPA is built on top of [VERL](https://github.com/volcengine/verl) (Volcano Engine Reinforcement Learning). The original VERL 0.6.1 documentation follows._

@@ -1,0 +1,37 @@
+#FROM 684288478426.dkr.ecr.us-west-2.amazonaws.com/verl:vemlp-th2.4.0-cu124-vllm0.6.3-ray2.10-te1.7-v0.0.3-install-aws-20250321
+#FROM 684288478426.dkr.ecr.us-west-2.amazonaws.com/verl:vemlp-th2.4.0-cu124-vllm0.6.3-ray2.10-te2.0-megatron0.11.0-install-aws-20250402
+#FROM 684288478426.dkr.ecr.us-west-2.amazonaws.com/verl:ngc-th2.6.0-cu124-vllm0.8.2-mcore0.11.0-te2.0-install-aws-20250415
+# FROM 684288478426.dkr.ecr.us-west-2.amazonaws.com/verl:ngc-cu124-vllm0.8.3-sglang0.4.5-mcore0.12.0-te2.2-install-aws-20250506
+
+# FROM 684288478426.dkr.ecr.us-east-1.amazonaws.com/verl:ngc-cu124-vllm0.8.3-sglang0.4.5-mcore0.12.0-te2.2-install-aws-dragon-vllm-20250523
+# FROM 684288478426.dkr.ecr.us-east-1.amazonaws.com/verl:ngc-cu124-vllm0.8.5-sglang0.4.6-mcore0.12.0-te2.3-install-aws-dragon-vllm-20250527
+
+FROM 684288478426.dkr.ecr.us-east-1.amazonaws.com/wwq-heapdapo:wwq_heapDAPO_verl_0.8.5_qwen3
+
+RUN export NVTE_FRAMEWORK=pytorch && pip3 install boto3
+
+# temparary depedencies for RufusChatbot
+RUN pip install --no-cache-dir trafilatura==2.0.0 requests_aws4auth==1.3.1 streamlit==1.46.0 mypy-boto3-dynamodb==1.39.0 mypy_boto3_lambda==1.40.7
+# dependency for structured_logger
+RUN pip install --no-cache-dir watchtower
+RUN pip install s3torchconnector
+RUN pip install pathlib-abc==0.3.1
+RUN pip install --upgrade transformers wandb openai
+
+RUN CODENAME=$(. /etc/os-release; echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") \
+   && mkdir -p /usr/share/keyrings \
+   && curl -fsSL https://fsx-lustre-client-repo-public-keys.s3.amazonaws.com/fsx-ubuntu-public-key.asc | \
+   gpg --dearmor -o /usr/share/keyrings/fsx-ubuntu-public-key.gpg \
+   && echo "deb [signed-by=/usr/share/keyrings/fsx-ubuntu-public-key.gpg] https://fsx-lustre-client-repo.s3.amazonaws.com/ubuntu ${CODENAME} main" | \
+   tee /etc/apt/sources.list.d/fsxlustreclientrepo.list >/dev/null \
+   && apt-get update \
+   && apt-get install -y "lustre-client-modules-$(uname -r)" || apt-get install -y linux-aws lustre-client-modules-aws
+
+RUN apt-get update && apt-get install -y curl jq && rm -rf /var/lib/apt/lists/*
+COPY examples/aws_batch/mount_fsx.sh /root/code/examples/mount_fsx.sh
+RUN chmod +x /root/code/examples/mount_fsx.sh
+COPY examples/ /root/code/examples/
+COPY recipe /root/code/recipe/
+COPY verl /root/code/verl/
+
+ENV PYTHONPATH="/root/code:/root/code/3rdparty/RufusChatbot/src:/root/code/3rdparty/PyNileCoreLib/src"
